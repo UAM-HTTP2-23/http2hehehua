@@ -11,22 +11,72 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         worker: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
-    
+    timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
-         node-version: 20
-        
-      - run: |
-          sudo apt install -y xvfb
+          node-version: 20
+
+      - name: Install tor and display server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tor xvfb
+          sudo mkdir -p /etc/tor/torrc.d
+          sudo tee /etc/tor/torrc.d/99-custom.conf > /dev/null <<'EOF'
+          SocksPort 127.0.0.1:9050
+          ControlPort 127.0.0.1:9051
+          MaxCircuitDirtiness 3600
+          NewCircuitPeriod 3600
+          CircuitBuildTimeout 60
+          ClientUseIPv6 0
+          EOF
+          sudo systemctl restart tor
+          for i in $(seq 1 30); do
+            if ss -tlnp 2>/dev/null | grep -q ':9050'; then
+              echo "tor SOCKS up after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          echo "runner egress (pre-tor): $(curl -s --max-time 10 https://api.ipify.org || true)"
+          curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip || true
+          echo
+
+      - name: Verify tor egress
+        run: |
+          direct=$(curl -s --max-time 10 https://api.ipify.org || true)
+          via_tor=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:9050 https://api.ipify.org || true)
+          echo "runner IP: $direct"
+          echo "tor exit : $via_tor"
+          if [ -z "$via_tor" ]; then
+            echo "FATAL: tor SOCKS not answering"
+            exit 1
+          fi
+          if [ "$direct" = "$via_tor" ]; then
+            echo "FATAL: tor is not egressing, flood would use runner IP"
+            exit 1
+          fi
+
+      - name: Install node deps
+        run: |
+          npm init -y > /dev/null 2>&1 || true
+          npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth \
+                      puppeteer-real-browser socks-proxy-agent
+
+      - name: Run flooder through tor
+        env:
+          DISPLAY: ':99'
+          TOR_SOCKS: 'socks5h://127.0.0.1:9050'
+        run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           export DISPLAY=:99
-          npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth puppeteer-real-browser
-          
-      - run: |
+          sleep 2
           node uam.js \
             "${{ github.event.inputs.url }}" \
             ${{ github.event.inputs.time }} \
